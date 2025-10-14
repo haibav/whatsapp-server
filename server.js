@@ -2,16 +2,16 @@ import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
-import makeWASocket, { 
+import { 
+  makeWASocket,
   DisconnectReason, 
   useMultiFileAuthState,
-  Browsers,
-  makeInMemoryStore
+  Browsers
 } from '@whiskeysockets/baileys';
-import { Boom } from '@hapi/boom';
 import { createClient } from '@supabase/supabase-js';
 import pino from 'pino';
 import QRCode from 'qrcode';
+import { existsSync, mkdirSync } from 'fs';
 
 const app = express();
 const server = createServer(app);
@@ -38,9 +38,6 @@ const logger = pino({ level: 'info' });
 // Store active WhatsApp sessions
 const activeSessions = new Map();
 
-// In-memory store for message sync
-const messageStore = makeInMemoryStore({ logger });
-
 // Helper: Get or create session
 async function getOrCreateSession(clientId, sessionName = 'default') {
   const sessionKey = `${clientId}-${sessionName}`;
@@ -56,167 +53,203 @@ async function getOrCreateSession(clientId, sessionName = 'default') {
 async function initializeWhatsApp(clientId, sessionName = 'default') {
   const sessionKey = `${clientId}-${sessionName}`;
   
-  logger.info({ sessionKey }, 'Initializing WhatsApp session');
-  
-  // Auth state stored in /data for persistence
-  const authPath = `/data/auth_${sessionKey}`;
-  const { state, saveCreds } = await useMultiFileAuthState(authPath);
-  
-  let qrCode = null;
-  let status = 'connecting';
-  
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-    browser: Browsers.ubuntu('Chrome'),
-    logger: pino({ level: 'silent' }),
-    syncFullHistory: false,
-    generateHighQualityLinkPreview: true
-  });
-  
-  // Bind message store
-  messageStore.bind(sock.ev);
-  
-  // Handle connection updates
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+  try {
+    logger.info({ sessionKey }, 'Initializing WhatsApp session');
     
-    if (qr) {
-      logger.info({ sessionKey }, 'QR Code generated');
-      
-      // Generate base64 QR code
-      qrCode = await QRCode.toDataURL(qr);
-      status = 'qr_ready';
-      
-      // Update Supabase
-      await supabase
-        .from('whatsapp_sessions')
-        .upsert({
-          client_id: clientId,
-          session_name: sessionName,
-          status: 'qr_ready',
-          qr_code: qrCode,
-          last_activity: new Date().toISOString()
-        }, {
-          onConflict: 'client_id,session_name'
-        });
-      
-      // Emit QR to connected clients
-      io.to(sessionKey).emit('qr-code', { qrCode, sessionKey });
+    // Ensure /data directory exists
+    if (!existsSync('/data')) {
+      mkdirSync('/data', { recursive: true });
+      logger.info('Created /data directory');
     }
     
-    if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-      logger.warn({ sessionKey, shouldReconnect }, 'Connection closed');
-      
-      if (!shouldReconnect) {
-        activeSessions.delete(sessionKey);
-        status = 'disconnected';
+    // Auth state stored in /data for persistence
+    const authPath = `/data/auth_${sessionKey}`;
+    const { state, saveCreds } = await useMultiFileAuthState(authPath);
+    
+    let qrCode = null;
+    let status = 'connecting';
+    
+    const sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      browser: Browsers.ubuntu('Chrome'),
+      logger: pino({ level: 'silent' }),
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: true
+    });
+    
+    // Handle connection updates
+    sock.ev.on('connection.update', async (update) => {
+      try {
+        const { connection, lastDisconnect, qr } = update;
         
-        await supabase
-          .from('whatsapp_sessions')
-          .update({ 
-            status: 'disconnected',
-            qr_code: null 
-          })
-          .eq('client_id', clientId)
-          .eq('session_name', sessionName);
+        if (qr) {
+          logger.info({ sessionKey }, 'QR Code generated');
+          
+          // Generate base64 QR code
+          qrCode = await QRCode.toDataURL(qr);
+          status = 'qr_ready';
+          
+          // Update Supabase
+          await supabase
+            .from('whatsapp_sessions')
+            .upsert({
+              client_id: clientId,
+              session_name: sessionName,
+              status: 'qr_ready',
+              qr_code: qrCode,
+              last_activity: new Date().toISOString()
+            }, {
+              onConflict: 'client_id,session_name'
+            });
+          
+          // Emit QR to connected clients
+          io.to(sessionKey).emit('qr-code', { qrCode, sessionKey });
+        }
         
-        io.to(sessionKey).emit('disconnected', { sessionKey });
-      } else {
-        // Reconnect
-        setTimeout(() => initializeWhatsApp(clientId, sessionName), 3000);
+        if (connection === 'close') {
+          const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+          logger.warn({ sessionKey, shouldReconnect }, 'Connection closed');
+          
+          if (!shouldReconnect) {
+            activeSessions.delete(sessionKey);
+            status = 'disconnected';
+            
+            await supabase
+              .from('whatsapp_sessions')
+              .update({ 
+                status: 'disconnected',
+                qr_code: null 
+              })
+              .eq('client_id', clientId)
+              .eq('session_name', sessionName);
+            
+            io.to(sessionKey).emit('disconnected', { sessionKey });
+          } else {
+            // Reconnect
+            setTimeout(() => initializeWhatsApp(clientId, sessionName), 3000);
+          }
+        } else if (connection === 'open') {
+          logger.info({ sessionKey, phoneNumber: sock.user?.id }, 'WhatsApp connected');
+          status = 'connected';
+          
+          await supabase
+            .from('whatsapp_sessions')
+            .upsert({
+              client_id: clientId,
+              session_name: sessionName,
+              status: 'connected',
+              phone_number: sock.user?.id || '',
+              qr_code: null,
+              last_activity: new Date().toISOString()
+            }, {
+              onConflict: 'client_id,session_name'
+            });
+          
+          io.to(sessionKey).emit('connected', { 
+            sessionKey, 
+            phoneNumber: sock.user?.id 
+          });
+        }
+      } catch (error) {
+        logger.error({ error, sessionKey }, 'Error in connection.update handler');
       }
-    } else if (connection === 'open') {
-      logger.info({ sessionKey, phoneNumber: sock.user?.id }, 'WhatsApp connected');
-      status = 'connected';
-      
-      await supabase
-        .from('whatsapp_sessions')
-        .upsert({
-          client_id: clientId,
-          session_name: sessionName,
-          status: 'connected',
-          phone_number: sock.user?.id || '',
-          qr_code: null,
-          last_activity: new Date().toISOString()
-        }, {
-          onConflict: 'client_id,session_name'
-        });
-      
-      io.to(sessionKey).emit('connected', { 
-        sessionKey, 
-        phoneNumber: sock.user?.id 
-      });
-    }
-  });
-  
-  // Save credentials on update
-  sock.ev.on('creds.update', saveCreds);
-  
-  // Handle incoming messages
-  sock.ev.on('messages.upsert', async (m) => {
-    const msg = m.messages[0];
-    if (!msg.message || msg.key.fromMe) return;
+    });
     
-    logger.info({ from: msg.key.remoteJid }, 'Incoming message');
+    // Save credentials on update
+    sock.ev.on('creds.update', saveCreds);
     
-    // Get session from DB
-    const { data: session } = await supabase
-      .from('whatsapp_sessions')
-      .select('id')
-      .eq('client_id', clientId)
-      .eq('session_name', sessionName)
-      .single();
+    // Handle incoming messages
+    sock.ev.on('messages.upsert', async (m) => {
+      try {
+        const msg = m.messages[0];
+        if (!msg.message || msg.key.fromMe) return;
+        
+        logger.info({ from: msg.key.remoteJid }, 'Incoming message');
+        
+        // Get session from DB
+        const { data: session } = await supabase
+          .from('whatsapp_sessions')
+          .select('id')
+          .eq('client_id', clientId)
+          .eq('session_name', sessionName)
+          .single();
+        
+        if (session) {
+          const content = msg.message.conversation || 
+                         msg.message.extendedTextMessage?.text || 
+                         '';
+          
+          // Save to database
+          const { data: savedMessage } = await supabase
+            .from('whatsapp_messages')
+            .insert({
+              session_id: session.id,
+              message_id: msg.key.id || '',
+              chat_id: msg.key.remoteJid || '',
+              from_number: msg.key.remoteJid || '',
+              to_number: sock.user?.id || '',
+              message_type: 'text',
+              content: content,
+              is_outgoing: false,
+              timestamp: new Date().toISOString(),
+              status: 'received'
+            })
+            .select()
+            .single();
+          
+          // Emit to connected clients
+          io.to(sessionKey).emit('message', savedMessage);
+        }
+      } catch (error) {
+        logger.error({ error, sessionKey }, 'Error processing incoming message');
+      }
+    });
     
-    if (session) {
-      const content = msg.message.conversation || 
-                     msg.message.extendedTextMessage?.text || 
-                     '';
-      
-      // Save to database
-      const { data: savedMessage } = await supabase
-        .from('whatsapp_messages')
-        .insert({
-          session_id: session.id,
-          message_id: msg.key.id || '',
-          chat_id: msg.key.remoteJid || '',
-          from_number: msg.key.remoteJid || '',
-          to_number: sock.user?.id || '',
-          message_type: 'text',
-          content: content,
-          is_outgoing: false,
-          timestamp: new Date().toISOString(),
-          status: 'received'
-        })
-        .select()
-        .single();
-      
-      // Emit to connected clients
-      io.to(sessionKey).emit('message', savedMessage);
-    }
-  });
-  
-  // Store session
-  const sessionData = {
-    sock,
-    status,
-    qrCode,
-    createdAt: Date.now()
-  };
-  
-  activeSessions.set(sessionKey, sessionData);
-  
-  return sessionData;
+    // Store session
+    const sessionData = {
+      sock,
+      status,
+      qrCode,
+      createdAt: Date.now()
+    };
+    
+    activeSessions.set(sessionKey, sessionData);
+    
+    return sessionData;
+    
+  } catch (error) {
+    logger.error({ error, sessionKey }, 'Critical error initializing WhatsApp');
+    throw error;
+  }
 }
 
 // API Routes
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    activeSessions: activeSessions.size,
-    uptime: process.uptime()
-  });
+app.get('/health', async (req, res) => {
+  try {
+    // Check Supabase connectivity
+    const { error: supabaseError } = await supabase
+      .from('whatsapp_sessions')
+      .select('id')
+      .limit(1);
+    
+    // Check /data directory
+    const dataExists = existsSync('/data');
+    
+    res.json({ 
+      status: 'ok',
+      activeSessions: activeSessions.size,
+      uptime: process.uptime(),
+      supabaseConnected: !supabaseError,
+      dataDirectory: dataExists ? 'exists' : 'missing',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      status: 'error',
+      error: error.message 
+    });
+  }
 });
 
 // Start WhatsApp session
@@ -244,10 +277,10 @@ app.post('/api/whatsapp/start', async (req, res) => {
     // Initialize new session
     session = await initializeWhatsApp(clientId, sessionName);
     
-    // Wait for QR code
+    // Wait for QR code (extended timeout)
     let attempts = 0;
-    while (attempts < 20 && !session.qrCode && session.status !== 'connected') {
-      await new Promise(resolve => setTimeout(resolve, 500));
+    while (attempts < 40 && !session.qrCode && session.status !== 'connected') {
+      await new Promise(resolve => setTimeout(resolve, 1000));
       attempts++;
     }
     
